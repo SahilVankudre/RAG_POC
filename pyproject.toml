@@ -1,0 +1,95 @@
+[project]
+name = "rag-poc"
+version = "0.1.0"
+description = "Semantic search over customer feedback: Amazon reviews → embeddings → FAISS retrieval."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faiss-cpu>=1.15.1",
+    "huggingface-hub>=2.2.0",
+    "numpy>=2.5.4",
+    "pandas>=3.0.6",
+    "pyarrow>=26.0.0",
+    "pydantic>=2",
+    "pydantic-settings>=2.16.0",
+    "sentence-transformers>=5.7.0",
+    "torch>=2.14.1",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+rag-poc = "rag_poc.entrypoints.cli:run"
+
+[build-system]
+requires = ["uv_build>=0.9.24,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "rag_poc"
+module-root = "src/backend/src"
+
+# --- Tooling ------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["src/backend/tests"]
+addopts = "-ra --import-mode=importlib -m 'not integration'"
+markers = ["integration: slow tests that load real models or touch the network"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src/backend/src", "src/backend/tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N"]
+
+[tool.importlinter]
+root_package = "rag_poc"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture: entrypoints > bootstrap > application > modules > lib"
+type = "layers"
+layers = [
+    "rag_poc.entrypoints",
+    "rag_poc.bootstrap",
+    "rag_poc.application",
+    "rag_poc.ingestion | rag_poc.preprocessing | rag_poc.embedding | rag_poc.retrieval",
+    "rag_poc.lib",
+]
+
+[[tool.importlinter.contracts]]
+name = "Entrypoints reach features only through the composition root"
+type = "forbidden"
+source_modules = ["rag_poc.entrypoints"]
+forbidden_modules = [
+    "rag_poc.application",
+    "rag_poc.ingestion",
+    "rag_poc.preprocessing",
+    "rag_poc.embedding",
+    "rag_poc.retrieval",
+]
+allow_indirect_imports = true  # reaching modules *through* bootstrap is the intended path
+
+[[tool.importlinter.contracts]]
+name = "Use cases and shared lib stay free of heavy ML / vector-store libraries"
+type = "forbidden"
+source_modules = ["rag_poc.application", "rag_poc.lib", "rag_poc.entrypoints"]
+forbidden_modules = ["torch", "sentence_transformers", "faiss", "huggingface_hub", "pyarrow"]
+allow_indirect_imports = true  # adapters own these imports; bootstrap may wire them
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.15",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+# CPU-only PyTorch everywhere (no CUDA downloads on Linux; a GPU is not required).
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
