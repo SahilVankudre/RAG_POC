@@ -11,6 +11,7 @@ it's installed, see [`RUN_MANUAL.md`](RUN_MANUAL.md).
 | **Git** | To clone the repository |
 | **uv** (recommended) or `pip` | uv installs from the lock file, so everyone gets identical versions |
 | **Internet access on the first run** | Downloads the dataset (~327 MB) and the embedding model (~90 MB) once; both are cached |
+| **An LLM, for `ask` and `evaluate`** | An API key for an OpenAI-format service such as OpenRouter, or a local Ollama model. `search` works without one |
 | **Disk space** | About 1.7 GB: virtual environment ~1.2 GB (mostly CPU PyTorch), Hugging Face cache ~400 MB, generated `data/` ~40 MB |
 | **GPU** | Not required. PyTorch is pinned to the CPU-only build |
 
@@ -54,7 +55,7 @@ uv sync
 This command:
 
 - creates `.venv/` and installs Python 3.12 into it if needed
-- installs the exact versions from `uv.lock`, including the development tools (pytest, ruff,
+- installs the exact versions from `uv.lock`, including the development tools (ruff and
   import-linter)
 - installs the project itself, which provides the `rag-poc` command
 
@@ -72,7 +73,7 @@ pip install -r requirements.txt
 
 - `requirements.txt` is exported from `uv.lock`. It adds the PyTorch CPU wheel index, so pip
   installs the small CPU-only torch instead of the multi-GB CUDA build.
-- It ends with `-e .`, which installs this project in editable mode and provides the `rag-poc`
+- It includes `-e .`, which installs this project in editable mode and provides the `rag-poc`
   command.
 - With the environment activated, run `rag-poc …` directly, without `uv run`.
 
@@ -91,17 +92,10 @@ also hosts older copies of some PyPI packages.
 ```bash
 uv run rag-poc --help        # lists the commands
 uv run rag-poc show-config   # prints the resolved configuration and file paths
-uv run pytest                # unit tests: expect "38 passed, 2 deselected" in about 10 s
 ```
 
-The unit tests need no network and no model. To also check the real embedding model (this
-downloads it on first use):
-
-```bash
-uv run pytest -m integration
-```
-
-Next, build the index and run a search as described in [`RUN_MANUAL.md`](RUN_MANUAL.md).
+Next, build the index and run a search as described in [`RUN_MANUAL.md`](RUN_MANUAL.md). To ask
+questions, also configure an LLM as described in [LLM configuration](#llm-configuration).
 
 ## 6. Configuration
 
@@ -125,6 +119,18 @@ Precedence, from lowest to highest: **defaults < `.env` < environment variables 
 | `RAG_EMBEDDING_QUERY_PREFIX` | model default | Instruction added to queries only. Set automatically for BGE models; `""` disables it |
 | `RAG_DEFAULT_TOP_K` | `5` | Results returned per search |
 | `RAG_SEARCH_MIN_WORDS` | `3` | Default minimum review length, in words, for search results |
+| `RAG_LLM_BASE_URL` | `http://localhost:11434/v1` | Any OpenAI-format API; the default is local Ollama |
+| `RAG_LLM_API_KEY` | none | API key; local servers don't need one |
+| `RAG_LLM_MODEL_NAME` | none, required for `ask` | Model to call |
+| `RAG_LLM_TEMPERATURE` | `0.2` | Lower is more repeatable |
+| `RAG_LLM_MAX_OUTPUT_TOKENS` | `1000` | Output limit; reasoning models may count their reasoning against it |
+| `RAG_LLM_TIMEOUT_SECONDS` | `120` | Time allowed per attempt |
+| `RAG_LLM_MAX_RETRIES` | `2` | Retries after temporary failures |
+| `RAG_LLM_EXTRA_BODY` | `{}` | JSON object of provider-specific request fields |
+| `RAG_ANSWER_TOP_K` | `10` | Reviews retrieved for each `ask` |
+| `RAG_ANSWER_REVIEW_MAX_CHARS` | `800` | Longest title or body sent to the LLM per review |
+| `RAG_ANSWER_MIN_RELEVANCE` | `0.33` | Below this, questions are refused without calling the LLM |
+| `RAG_EVALUATION_QUESTIONS_PATH` | `evaluation/test_questions.json` | Question set for `evaluate` |
 | `RAG_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
 Example `.env`:
@@ -153,15 +159,50 @@ startup with a clear `Invalid configuration` error.
 **Optional:** setting `HF_TOKEN` (a Hugging Face access token) raises download rate limits. It
 is not required, because the dataset is public.
 
+### LLM configuration
+
+`ask` and `evaluate` need an LLM. Any API that speaks the OpenAI chat completions format works, so
+changing provider means changing settings, not code. Start from the template:
+
+```bash
+cp .env.example .env
+```
+
+Keep one preset active, put your key in `RAG_LLM_API_KEY`, then confirm the setup:
+
+```bash
+uv run rag-poc llm-check     # expect "ready", the time taken and token counts
+```
+
+The default preset uses OpenRouter:
+
+```ini
+RAG_LLM_BASE_URL=https://openrouter.ai/api/v1
+RAG_LLM_MODEL_NAME=deepseek/deepseek-v4.1-flash-1017
+RAG_LLM_API_KEY=your-api-key-here
+RAG_LLM_EXTRA_BODY='{"reasoning": {"effort": "none"}}'
+```
+
+`.env.example` also has presets for DeepSeek, OpenAI and local Ollama. Keep these points in mind:
+
+- **Never commit `.env`.** It's gitignored, and `show-config` masks the key.
+- **`RAG_LLM_EXTRA_BODY` differs by provider.** Reasoning models spend the output limit on reasoning,
+  and DeepSeek ignores temperature while thinking is on. Turning it off uses `reasoning` on
+  OpenRouter but `thinking` on DeepSeek directly.
+- **`OPENAI_API_KEY` and `OPENAI_BASE_URL` are deliberately ignored,** so one provider's key can't
+  reach another provider.
+- **Local models must fit in free memory.** Ollama refuses to load a model that doesn't.
+
 ## 7. Where files are stored
 
 | Location | Contents | Safe to delete? |
 |---|---|---|
 | `.venv/` | Virtual environment | Yes. Recreate it with `uv sync` |
-| `data/` | Sample, prepared feedback, embeddings, FAISS index | Yes. Recreate it with `rag-poc build-index` |
+| `data/` | Sample, prepared feedback, embeddings, FAISS index, evaluation runs | Yes. Recreate it with `rag-poc build-index` and `rag-poc evaluate` |
+| `.env` | Your LLM settings and API key | Only if you can recreate it from `.env.example` |
 | `~/.cache/huggingface/` (Windows: `%USERPROFILE%\.cache\huggingface\`) | Raw dataset JSONL and model weights | Yes, but they will be downloaded again |
 
-Nothing in `data/`, `.venv/` or the cache is committed to Git.
+Nothing in `data/`, `.venv/`, `.env` or the cache is committed to Git.
 
 ## 8. Troubleshooting
 
@@ -175,14 +216,18 @@ Nothing in `data/`, `.venv/` or the cache is committed to Git.
 | The first `search` takes about 10 s | Expected: torch and the model load once. Use the interactive session (`rag-poc search` with no query) so later queries take milliseconds |
 | Warning about symlinks in the Hugging Face cache on Windows | Harmless (the cache copies files instead), and the CLI suppresses it |
 | `Invalid configuration: …` | A `RAG_*` variable or `.env` entry has an invalid value. The message names the field |
+| `Error: No LLM model is configured` | Set up `.env` as described in [LLM configuration](#llm-configuration) |
+| `Error: … rejected the API key` | `RAG_LLM_API_KEY` is missing, is still the placeholder, or belongs to another provider than `RAG_LLM_BASE_URL` |
+| `Error: … has no model '…', or the URL is wrong` | Check `RAG_LLM_MODEL_NAME` and `RAG_LLM_BASE_URL`. OpenRouter model ids look like `provider/model` |
+| `Error: Could not connect to …` | Check `RAG_LLM_BASE_URL` and your network. For a local model, check that the server is running |
+| `Error: … failed with status 500: model requires more system memory` | The local model doesn't fit in free memory. Use a smaller model or a hosted one |
+| `Error: … reached the output limit … before writing an answer` | The model spent the limit on reasoning. Turn reasoning off with `RAG_LLM_EXTRA_BODY`, or raise `RAG_LLM_MAX_OUTPUT_TOKENS` |
 
 ## 9. Development tools
 
 The development tools are installed by `uv sync` (they are in the `dev` dependency group):
 
 ```bash
-uv run pytest                        # unit tests
-uv run pytest -m integration         # tests with the real model
 uv run ruff check .                  # lint
 uv run ruff format .                 # format (line length 100)
 uv run lint-imports                  # enforce module boundaries

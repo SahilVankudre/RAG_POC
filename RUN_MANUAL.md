@@ -1,7 +1,7 @@
 # Run Manual
 
-How to run RAG POC: building the search index, searching, and what each command does and
-produces. Install the project first, as described in [`SETUP.md`](SETUP.md).
+How to run RAG POC: building the search index, searching, asking questions, and what each command
+does and produces. Install the project first, as described in [`SETUP.md`](SETUP.md).
 
 Run all commands from the repository root. With uv, prefix each command with `uv run`. With an
 activated virtual environment, call `rag-poc` directly. `python -m rag_poc …` is equivalent.
@@ -13,10 +13,12 @@ activated virtual environment, call `rag-poc` directly. `python -m rag_poc …` 
 3. [Running the stages one at a time](#3-running-the-stages-one-at-a-time)
 4. [Searching](#4-searching)
 5. [Search tips](#search-tips)
-6. [Output files](#6-output-files)
-7. [Rebuilding, resetting and reuse](#7-rebuilding-resetting-and-reuse)
-8. [Scaling up and switching models](#8-scaling-up-and-switching-models)
-9. [Errors and exit codes](#9-errors-and-exit-codes)
+6. [Asking questions](#6-asking-questions)
+7. [Evaluating answers](#7-evaluating-answers)
+8. [Output files](#8-output-files)
+9. [Rebuilding, resetting and reuse](#9-rebuilding-resetting-and-reuse)
+10. [Scaling up and switching models](#10-scaling-up-and-switching-models)
+11. [Errors and exit codes](#11-errors-and-exit-codes)
 
 ---
 
@@ -33,6 +35,9 @@ activated virtual environment, call `rag-poc` directly. `python -m rag_poc …` 
 | `rag-poc index [--force]` | Builds the FAISS index from stored embeddings | < 1 s |
 | `rag-poc build-index [--force]` | Runs sample → prepare → embed → index | ~2–3 min on first run, ~1 s afterwards |
 | `rag-poc search [QUERY] [options]` | One-shot search, or an interactive session without a query | ~10 s to load, then ~12 ms per query |
+| `rag-poc llm-check [PROMPT]` | Sends one prompt to the configured LLM, to confirm it works | a few seconds |
+| `rag-poc ask QUESTION [options]` | Answers from the reviews, citing the ones used | ~10 s to load, then ~4 s per answer with a hosted LLM |
+| `rag-poc evaluate` | Runs the 20 evaluation questions and saves full results | ~1.5 min with a hosted LLM |
 
 Global option (put it **before** the command): `--log-level DEBUG|INFO|WARNING|ERROR`, for
 example `uv run rag-poc --log-level WARNING build-index`.
@@ -220,6 +225,7 @@ an empty query) is shown, and the session continues.
 | `--max-rating R` | none | Only reviews rated ≤ R. Use `2` for complaints |
 | `--min-rating R` | none | Only reviews rated ≥ R. Use `4` for praise |
 | `--min-words N` | 3 (`RAG_SEARCH_MIN_WORDS`) | Skip reviews with fewer than N words. Use `0` to allow all |
+| `--product ASIN` | none | Only reviews of one product |
 
 Filtered search is still **exact**: if too few of the nearest reviews pass the filters, the
 search fetches more candidates until it has `top_k` passing results or has checked every review.
@@ -262,7 +268,104 @@ sample, counting relevant results in the top 5–6:
 
 ---
 
-## 6. Output files
+## 6. Asking questions
+
+`ask` retrieves the most relevant reviews, sends them to the LLM, and checks the reply. It needs an
+LLM to be configured. See [LLM configuration](SETUP.md#llm-configuration).
+
+```bash
+uv run rag-poc ask "Are customers satisfied with packaging?"
+uv run rag-poc ask "What are the common quality complaints?" --max-rating 2
+uv run rag-poc ask "Are there any complaints?" --product B00EEN2HCS
+uv run rag-poc ask "What are the common quality complaints?" --max-rating 2 --show-context
+```
+
+### Options
+
+`ask` accepts the same filters as `search`, plus one more:
+
+| Option | Default | Effect |
+|---|---|---|
+| `--top-k N`, `-k N` | 10 (`RAG_ANSWER_TOP_K`) | Number of reviews sent to the LLM |
+| `--max-rating R`, `--min-rating R`, `--min-words N`, `--product ASIN` | as in `search` | Which reviews may be used |
+| `--show-context` | off | Also prints exactly what the LLM received |
+
+### Reading the output
+
+| Section | Meaning |
+|---|---|
+| Question | The question as asked |
+| Retrieved reviews | Everything fetched, with labels (`R1`…) and similarity scores. The heading shows the relevance score |
+| Context sent to the LLM | Only with `--show-context`: each review with its label and real id |
+| Answer | The answer, with citations such as `[R3]` after each claim, and its status |
+| Supporting reviews | Only the reviews the answer cites, with their real ids, ratings and text |
+
+Citations are checked in code. Labels of reviews that weren't retrieved are removed, and a warning
+names them. Supporting reviews come from those checked citations, not from the model's text.
+
+### When it won't answer
+
+A question that the reviews can't support gets "not enough evidence" rather than a guess. The
+heading shows `insufficient_evidence` and one of these reasons:
+
+| Reason | Meaning | Example | LLM called |
+|---|---|---|---|
+| `no_matching_reviews` | No review passes the filters | An unknown `--product` | No |
+| `low_relevance` | The feedback doesn't appear to discuss the topic | "What is the capital of France?" | No |
+| `model_declined` | The reviews are on topic but don't contain the answer | "Is this shampoo FDA approved?" | Yes |
+| `no_valid_citations` | The reply cited no retrieved review, so it isn't shown | Rare | Yes |
+
+Relevance is the mean similarity of the top 10 reviews across **all** feedback, ignoring `--top-k`
+and filters. Filters shrink the pool of reviews, which lowers scores even for sensible questions.
+Below `RAG_ANSWER_MIN_RELEVANCE` (0.33), the question is refused. This is only a cheap first filter,
+because a review can match a question's topic without answering it. The LLM catches the rest.
+
+### Getting good answers
+
+- **Asking about problems?** Add `--max-rating 2`. Retrieval matches topic rather than opinion, so
+  without it complaints can be crowded out by positive reviews. "Common quality problems" retrieved
+  5 relevant reviews of 10 without the filter and 9 of 10 with it.
+- **Don't read "not found" as "doesn't exist".** Answers see only the most similar reviews.
+- **Don't read answers as percentages.** They describe the retrieved reviews, not all customers.
+- **"This product" means little without `--product`.** The sample has 7,576 products, and most have
+  a single review, so answers usually cover many products.
+
+### Using it from Python
+
+The answer and its sources are structured data, ready for an API or UI:
+
+```python
+from rag_poc.bootstrap import build_container
+
+response = build_container().rag_service.ask("Are customers satisfied with packaging?", top_k=10)
+response.answer  # the answer text
+[source.review.feedback_id for source in response.cited]  # reviews it relies on
+response.to_dict()  # everything, ready for JSON
+```
+
+---
+
+## 7. Evaluating answers
+
+```bash
+uv run rag-poc evaluate
+```
+
+Runs the questions in `evaluation/test_questions.json` through the same pipeline as `ask`. It prints
+a table showing whether each was answered or refused as expected, and how many made-up citations
+were removed. One failed LLM call is recorded without losing the rest of the run.
+
+**Writes:** `data/evaluation/run_<timestamp>.json`, with every question's answer, retrieved reviews,
+cited reviews and context.
+
+The table can't tell whether answers are true. A clean run can still contain unsupported claims,
+so read the answers against their reviews, especially after changing the prompt. Answers vary
+between runs, so run it more than once. See [Answer quality](README.md#answer-quality) for the
+measured results.
+
+---
+
+## 8. Output files
 
 All files live under `RAG_DATA_DIR` (default `data/`). The folder is gitignored and safe to
 delete.
@@ -277,6 +380,7 @@ delete.
 | `index/faiss.index` | `index` | FAISS `IndexFlatIP` |
 | `index/id_map.parquet` | `index` | Vector position → full review |
 | `index/index_manifest.json` | `index` | Model, dimension, count, embeddings fingerprint |
+| `evaluation/run_<timestamp>.json` | `evaluate` | Every question's answer, sources and outcome |
 
 To explore the data yourself:
 
@@ -289,7 +393,7 @@ items[["feedback_id", "rating", "embedding_text"]].head()
 
 ---
 
-## 7. Rebuilding, resetting and reuse
+## 9. Rebuilding, resetting and reuse
 
 | Situation | What happens / what to run |
 |---|---|
@@ -302,7 +406,7 @@ items[["feedback_id", "rating", "embedding_text"]].head()
 
 ---
 
-## 8. Scaling up and switching models
+## 10. Scaling up and switching models
 
 **Larger sample (50K reviews):**
 
@@ -331,15 +435,24 @@ Its query instruction is applied automatically. It is more precise on opinion qu
 strong" 5/5 vs 2/5) but embeds about 2× slower. Keep the variable set for `search` too, or put
 it in `.env`.
 
+**Different LLM:** change the `RAG_LLM_*` settings in `.env`, then confirm with
+`uv run rag-poc llm-check`. No rebuild is needed, because the index doesn't depend on the LLM.
+
 ---
 
-## 9. Errors and exit codes
+## 11. Errors and exit codes
 
 Expected problems print a red `Error: …` message that names the next step, and the command
 exits with code **1** (no traceback). For example:
 
 ```
 Error: No prepared feedback at …\data\processed\feedback_items.parquet. Run `rag-poc prepare` first.
+```
+
+LLM failures work the same way, for example:
+
+```
+Error: https://openrouter.ai/api/v1 rejected the API key. Check RAG_LLM_API_KEY.
 ```
 
 A full Python traceback means an unexpected bug. Please report it with the command you ran.
